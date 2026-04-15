@@ -1,0 +1,248 @@
+// =======================================================
+// EXERCISE 2: Flood Detection Using Optical Imagery
+// Case study: Dhaka, Bangladesh
+// Final cleaner version for urban flood mapping
+// =======================================================
+
+// -------------------------------
+// 1. Study area
+// -------------------------------
+// Central Dhaka-focused AOI
+var aoi = ee.Geometry.Rectangle([90.30, 23.68, 90.50, 23.86]);
+Map.centerObject(aoi, 11);
+Map.addLayer(aoi, {color: 'red'}, 'AOI');
+
+// -------------------------------
+// 2. Dates
+// -------------------------------
+var preStart  = '2023-07-01';
+var preEnd    = '2023-07-31';
+
+var postStart = '2023-08-01';
+var postEnd   = '2023-08-31';
+
+// -------------------------------
+// 3. Load Sentinel-2 Surface Reflectance
+// -------------------------------
+var s2sr = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(aoi)
+  .filter(ee.Filter.date(preStart, postEnd))
+  .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', 80));
+
+// -------------------------------
+// 4. Cloud / shadow masking using SCL
+// -------------------------------
+function maskS2(image) {
+  var scl = image.select('SCL');
+
+  // Keep only good classes
+  var mask = scl.neq(3)   // cloud shadow
+    .and(scl.neq(8))      // cloud medium probability
+    .and(scl.neq(9))      // cloud high probability
+    .and(scl.neq(10))     // cirrus
+    .and(scl.neq(11))     // snow/ice
+    .and(scl.neq(1));     // saturated / defective
+
+  return image.updateMask(mask)
+              .divide(10000)
+              .copyProperties(image, image.propertyNames());
+}
+
+var s2 = s2sr.map(maskS2);
+
+// -------------------------------
+// 5. Split pre and post collections
+// -------------------------------
+var preCol = s2.filterDate(preStart, preEnd);
+var postCol = s2.filterDate(postStart, postEnd);
+
+print('Pre collection size:', preCol.size());
+print('Post collection size:', postCol.size());
+
+// -------------------------------
+// 6. Build median composites
+// -------------------------------
+var preImage = preCol.median().clip(aoi);
+var postImage = postCol.median().clip(aoi);
+
+print('Pre bands:', preImage.bandNames());
+print('Post bands:', postImage.bandNames());
+
+// -------------------------------
+// 7. Add spectral indices
+// -------------------------------
+function addIndices(img) {
+  var mndwi = img.normalizedDifference(['B3', 'B11']).rename('MNDWI');
+  var ndvi  = img.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  var ndbi  = img.normalizedDifference(['B11', 'B8']).rename('NDBI');
+  return img.addBands([mndwi, ndvi, ndbi]);
+}
+
+preImage = addIndices(preImage);
+postImage = addIndices(postImage);
+
+// -------------------------------
+// 8. Display RGB
+// -------------------------------
+var rgbVis = {
+  bands: ['B4', 'B3', 'B2'],
+  min: 0.02,
+  max: 0.30
+};
+
+Map.addLayer(preImage, rgbVis, 'Pre RGB');
+Map.addLayer(postImage, rgbVis, 'Post RGB');
+
+// -------------------------------
+// 9. Display MNDWI
+// -------------------------------
+var mndwiVis = {
+  min: -1,
+  max: 1,
+  palette: ['brown', 'yellow', 'cyan', 'blue']
+};
+
+Map.addLayer(preImage.select('MNDWI'), mndwiVis, 'Pre MNDWI');
+Map.addLayer(postImage.select('MNDWI'), mndwiVis, 'Post MNDWI');
+
+// -------------------------------
+// 10. Stricter water detection
+// -------------------------------
+// Urban optical flood mapping needs strict rules.
+// Water should have:
+// - reasonably high MNDWI
+// - low vegetation
+// - not strongly built-up
+// - low NIR reflectance
+// - low SWIR reflectance
+
+var mndwiThresh = 0.18;
+var ndviThresh  = 0.15;
+var ndbiThresh  = 0.10;
+var nirThresh   = 0.18;
+var swirThresh  = 0.12;
+
+function classifyWater(img) {
+  var water = img.select('MNDWI').gt(mndwiThresh)
+    .and(img.select('NDVI').lt(ndviThresh))
+    .and(img.select('NDBI').lt(ndbiThresh))
+    .and(img.select('B8').lt(nirThresh))
+    .and(img.select('B11').lt(swirThresh));
+
+  return water.rename('water');
+}
+
+var preWater = classifyWater(preImage);
+var postWater = classifyWater(postImage);
+
+Map.addLayer(preWater.updateMask(preWater), {palette: ['0000FF']}, 'Pre-water');
+Map.addLayer(postWater.updateMask(postWater), {palette: ['00FFFF']}, 'Post-water');
+
+// -------------------------------
+// 11. Flood extent = post water but not pre water
+// -------------------------------
+var floodRaw = postWater.and(preWater.not()).rename('floodRaw');
+Map.addLayer(floodRaw.updateMask(floodRaw), {palette: ['FF0000']}, 'Raw flood');
+
+// -------------------------------
+// 12. Remove permanent water
+// -------------------------------
+var gsw = ee.Image('JRC/GSW1_4/GlobalSurfaceWater');
+var occurrence = gsw.select('occurrence');
+
+// Treat frequently wet pixels as permanent water
+var permanentWater = occurrence.gt(40);
+
+Map.addLayer(permanentWater.updateMask(permanentWater), {palette: ['000080']}, 'Permanent water');
+
+var floodNoPermanent = floodRaw.and(permanentWater.not()).rename('floodNoPermanent');
+Map.addLayer(floodNoPermanent.updateMask(floodNoPermanent), {palette: ['FF00FF']}, 'Flood no permanent water');
+
+// -------------------------------
+// 13. Remove tiny noisy patches
+// -------------------------------
+var connected = floodNoPermanent.connectedPixelCount(100, true);
+var floodClean = floodNoPermanent.updateMask(connected.gte(20)).rename('floodClean');
+
+Map.addLayer(floodClean.updateMask(floodClean), {palette: ['FF00FF']}, 'Final flood extent');
+
+// -------------------------------
+// 14. Flood area calculation
+// -------------------------------
+var floodAreaImg = floodClean.multiply(ee.Image.pixelArea());
+
+var floodArea = floodAreaImg.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: aoi,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+var floodAreaSqm = ee.Number(floodArea.get('floodClean'));
+var floodAreaKm2 = floodAreaSqm.divide(1e6);
+
+print('Flooded area (square meters):', floodAreaSqm);
+print('Flooded area (km²):', floodAreaKm2);
+
+// -------------------------------
+// 15. Land cover analysis
+// -------------------------------
+var worldCover = ee.ImageCollection('ESA/WorldCover/v200').first().clip(aoi);
+var lc = worldCover.select('Map');
+
+Map.addLayer(lc, {}, 'Land cover');
+
+var floodByLC = floodClean.addBands(lc);
+
+var grouped = floodByLC.reduceRegion({
+  reducer: ee.Reducer.sum().group({
+    groupField: 1,
+    groupName: 'landcover'
+  }),
+  geometry: aoi,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+print('Flooded pixels by land cover class:', grouped);
+
+// -------------------------------
+// 16. Optional: urban flood only
+// -------------------------------
+// Built-up class in ESA WorldCover = 50
+var builtUp = lc.eq(50);
+var urbanFlood = floodClean.and(builtUp).rename('urbanFlood');
+
+Map.addLayer(urbanFlood.updateMask(urbanFlood), {palette: ['FFFF00']}, 'Urban flood only');
+
+// -------------------------------
+// 17. Export raster
+// -------------------------------
+Export.image.toDrive({
+  image: floodClean,
+  description: 'Dhaka_FloodExtent_Final_Optical',
+  folder: 'GEE_Flood_Assignment',
+  fileNamePrefix: 'Dhaka_FloodExtent_Final_Optical',
+  region: aoi,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+// -------------------------------
+// 18. Export vector polygons
+// -------------------------------
+var floodVectors = floodClean.selfMask().reduceToVectors({
+  geometry: aoi,
+  scale: 10,
+  geometryType: 'polygon',
+  eightConnected: true,
+  labelProperty: 'flood',
+  maxPixels: 1e13
+});
+
+Export.table.toDrive({
+  collection: floodVectors,
+  description: 'Dhaka_FloodExtent_Final_Polygons',
+  folder: 'GEE_Flood_Assignment',
+  fileFormat: 'SHP'
+});
