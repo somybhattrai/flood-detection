@@ -1,0 +1,351 @@
+// =======================================================
+// EXERCISE 2: Flood Detection Using Optical Imagery
+// Case study: Assam Flood, India
+// Corrected robust version
+// =======================================================
+
+// -------------------------------------------------------
+// 1. STUDY AREA
+// -------------------------------------------------------
+// Smaller AOI near Guwahati and Brahmaputra floodplain
+var aoi = ee.Geometry.Rectangle([91.55, 26.05, 91.95, 26.35]);
+
+Map.centerObject(aoi, 10);
+Map.addLayer(aoi, {color: 'black'}, 'AOI');
+
+// -------------------------------------------------------
+// 2. DATES
+// -------------------------------------------------------
+// Wider windows to avoid empty collections
+var preStart  = '2022-04-20';
+var preEnd    = '2022-05-31';
+
+var postStart = '2022-06-10';
+var postEnd   = '2022-07-25';
+
+// -------------------------------------------------------
+// 3. LOAD SENTINEL-2
+// -------------------------------------------------------
+var s2sr = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(aoi)
+  .filterDate(preStart, postEnd)
+  .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', 80));
+
+// -------------------------------------------------------
+// 4. CLOUD MASK
+// -------------------------------------------------------
+function maskS2(image) {
+  var scl = image.select('SCL');
+
+  var mask = scl.neq(1)   // saturated / defective
+    .and(scl.neq(3))      // cloud shadow
+    .and(scl.neq(8))      // medium cloud probability
+    .and(scl.neq(9))      // high cloud probability
+    .and(scl.neq(10))     // cirrus
+    .and(scl.neq(11));    // snow / ice
+
+  return image.updateMask(mask)
+              .divide(10000)
+              .copyProperties(image, image.propertyNames());
+}
+
+var s2 = s2sr.map(maskS2);
+
+// -------------------------------------------------------
+// 5. SPLIT COLLECTIONS
+// -------------------------------------------------------
+var preCol = s2.filterDate(preStart, preEnd);
+var postCol = s2.filterDate(postStart, postEnd);
+
+print('All S2 images after AOI/date/cloud filter:', s2.size());
+print('Pre collection size:', preCol.size());
+print('Post collection size:', postCol.size());
+print('Pre first image:', preCol.first());
+print('Post first image:', postCol.first());
+
+// -------------------------------------------------------
+// 6. BUILD COMPOSITES
+// -------------------------------------------------------
+var preImage = preCol.median().clip(aoi);
+var postImage = postCol.median().clip(aoi);
+
+print('Pre bands:', preImage.bandNames());
+print('Post bands:', postImage.bandNames());
+
+// -------------------------------------------------------
+// 7. ADD INDICES
+// -------------------------------------------------------
+function addIndices(img) {
+  var mndwi = img.normalizedDifference(['B3', 'B11']).rename('MNDWI');
+  var ndvi  = img.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  return img.addBands([mndwi, ndvi]);
+}
+
+preImage = addIndices(preImage);
+postImage = addIndices(postImage);
+
+// -------------------------------------------------------
+// 8. DISPLAY RGB
+// -------------------------------------------------------
+var rgbVis = {
+  bands: ['B4', 'B3', 'B2'],
+  min: 0.02,
+  max: 0.30
+};
+
+Map.addLayer(preImage, rgbVis, 'Pre RGB');
+Map.addLayer(postImage, rgbVis, 'Post RGB');
+
+// -------------------------------------------------------
+// 9. DISPLAY MNDWI
+// -------------------------------------------------------
+var mndwiVis = {
+  min: -1,
+  max: 1,
+  palette: ['brown', 'yellow', 'cyan', 'blue']
+};
+
+Map.addLayer(preImage.select('MNDWI'), mndwiVis, 'Pre MNDWI');
+Map.addLayer(postImage.select('MNDWI'), mndwiVis, 'Post MNDWI');
+
+// -------------------------------------------------------
+// 10. WATER CLASSIFICATION
+// -------------------------------------------------------
+var mndwiThresh = 0.00;
+var ndviThresh = 0.30;
+
+function classifyWater(img) {
+  return img.select('MNDWI').gt(mndwiThresh)
+    .and(img.select('NDVI').lt(ndviThresh))
+    .rename('water');
+}
+
+var preWater = classifyWater(preImage);
+var postWater = classifyWater(postImage);
+
+Map.addLayer(preWater.updateMask(preWater), {palette: ['0000FF']}, 'Pre-water');
+Map.addLayer(postWater.updateMask(postWater), {palette: ['00FFFF']}, 'Post-water');
+
+// -------------------------------------------------------
+// 11. FLOOD EXTENT
+// -------------------------------------------------------
+var floodRaw = postWater.and(preWater.not()).rename('floodRaw');
+Map.addLayer(floodRaw.updateMask(floodRaw), {palette: ['FF0000']}, 'Raw flood extent');
+
+// -------------------------------------------------------
+// 12. REMOVE PERMANENT WATER
+// -------------------------------------------------------
+var gsw = ee.Image('JRC/GSW1_4/GlobalSurfaceWater');
+var occurrence = gsw.select('occurrence');
+var permanentWater = occurrence.gt(60);
+
+Map.addLayer(permanentWater.updateMask(permanentWater), {palette: ['000080']}, 'Permanent water');
+
+var floodNoPermanent = floodRaw.and(permanentWater.not()).rename('floodNoPermanent');
+Map.addLayer(floodNoPermanent.updateMask(floodNoPermanent), {palette: ['FF00FF']}, 'Flood no permanent water');
+
+// -------------------------------------------------------
+// 13. CLEAN SMALL PATCHES
+// -------------------------------------------------------
+var connected = floodNoPermanent.connectedPixelCount(100, true);
+var floodClean = floodNoPermanent.updateMask(connected.gte(8)).rename('floodClean');
+
+Map.addLayer(floodClean.updateMask(floodClean), {palette: ['0000FF']}, 'Final flood extent');
+
+// -------------------------------------------------------
+// 14. AREA
+// -------------------------------------------------------
+var floodAreaImg = floodClean.multiply(ee.Image.pixelArea());
+
+var floodArea = floodAreaImg.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: aoi,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+var floodAreaSqm = ee.Number(floodArea.get('floodClean'));
+var floodAreaKm2 = floodAreaSqm.divide(1e6);
+
+print('Flooded area (square meters):', floodAreaSqm);
+print('Flooded area (km²):', floodAreaKm2);
+
+// -------------------------------------------------------
+// 15. LAND COVER
+// -------------------------------------------------------
+var worldCover = ee.ImageCollection('ESA/WorldCover/v200').first().clip(aoi);
+var lc = worldCover.select('Map');
+
+var floodByLC = floodClean.addBands(lc);
+
+var grouped = floodByLC.reduceRegion({
+  reducer: ee.Reducer.sum().group({
+    groupField: 1,
+    groupName: 'landcover'
+  }),
+  geometry: aoi,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+print('Flooded pixels by land cover class:', grouped);
+
+// Optional urban flood only
+var builtUp = lc.eq(50);
+var urbanFlood = floodClean.and(builtUp).rename('urbanFlood');
+
+Map.addLayer(urbanFlood.updateMask(urbanFlood), {palette: ['FFFF00']}, 'Urban flood only');
+
+
+
+// =======================================================
+// EXPORT SECTION (ASSAM FLOOD PROJECT)
+// =======================================================
+
+// -------------------------------
+// Define Drive folder name
+// -------------------------------
+var exportFolder = 'GEE_Flood_Assignment_Assam';
+
+// -------------------------------
+// Prepare layers for export
+// -------------------------------
+var preWaterByte = preWater.selfMask().toByte();
+var postWaterByte = postWater.selfMask().toByte();
+var floodByte = floodClean.selfMask().toByte();
+var urbanFloodByte = urbanFlood.selfMask().toByte();
+
+var preRGB = preImage.select(['B4', 'B3', 'B2']);
+var postRGB = postImage.select(['B4', 'B3', 'B2']);
+var landCover = lc.toByte();
+
+// -------------------------------
+// Create flood polygons
+// -------------------------------
+var floodVectors = floodClean.selfMask().reduceToVectors({
+  geometry: aoi,
+  scale: 10,
+  geometryType: 'polygon',
+  eightConnected: true,
+  labelProperty: 'flood',
+  maxPixels: 1e13
+});
+
+// -------------------------------
+// Summary table (for report)
+// -------------------------------
+var summary = ee.FeatureCollection([
+  ee.Feature(null, {
+    event_name: 'Assam Flood 2022',
+    location: 'Assam, India',
+    study_area: 'Brahmaputra floodplain near Guwahati',
+    pre_start: preStart,
+    pre_end: preEnd,
+    post_start: postStart,
+    post_end: postEnd,
+    flooded_area_km2: floodAreaKm2
+  })
+]);
+
+// =======================================================
+// EXPORT RASTERS
+// =======================================================
+
+// 1. Pre-flood RGB
+Export.image.toDrive({
+  image: preRGB,
+  description: 'Assam_PreFlood_RGB',
+  folder: exportFolder,
+  fileNamePrefix: 'Assam_PreFlood_RGB',
+  region: aoi,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+// 2. Post-flood RGB
+Export.image.toDrive({
+  image: postRGB,
+  description: 'Assam_PostFlood_RGB',
+  folder: exportFolder,
+  fileNamePrefix: 'Assam_PostFlood_RGB',
+  region: aoi,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+// 3. Pre-water mask
+Export.image.toDrive({
+  image: preWaterByte,
+  description: 'Assam_PreWater',
+  folder: exportFolder,
+  fileNamePrefix: 'Assam_PreWater',
+  region: aoi,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+// 4. Post-water mask
+Export.image.toDrive({
+  image: postWaterByte,
+  description: 'Assam_PostWater',
+  folder: exportFolder,
+  fileNamePrefix: 'Assam_PostWater',
+  region: aoi,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+// 5. Final flood extent
+Export.image.toDrive({
+  image: floodByte,
+  description: 'Assam_FinalFloodExtent',
+  folder: exportFolder,
+  fileNamePrefix: 'Assam_FinalFloodExtent',
+  region: aoi,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+// 6. Urban flood only
+Export.image.toDrive({
+  image: urbanFloodByte,
+  description: 'Assam_UrbanFloodOnly',
+  folder: exportFolder,
+  fileNamePrefix: 'Assam_UrbanFloodOnly',
+  region: aoi,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+// 7. Land cover
+Export.image.toDrive({
+  image: landCover,
+  description: 'Assam_LandCover',
+  folder: exportFolder,
+  fileNamePrefix: 'Assam_LandCover',
+  region: aoi,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+// =======================================================
+// EXPORT VECTOR + TABLE
+// =======================================================
+
+// 8. Flood polygons (SHP)
+Export.table.toDrive({
+  collection: floodVectors,
+  description: 'Assam_FloodPolygons',
+  folder: exportFolder,
+  fileNamePrefix: 'Assam_FloodPolygons',
+  fileFormat: 'SHP'
+});
+
+// 9. Summary CSV
+Export.table.toDrive({
+  collection: summary,
+  description: 'Assam_FloodSummary',
+  folder: exportFolder,
+  fileNamePrefix: 'Assam_FloodSummary',
+  fileFormat: 'CSV'
+});
