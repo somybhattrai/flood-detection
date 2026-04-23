@@ -1,0 +1,815 @@
+/**** FINAL FLOOD DETECTION SCRIPT
+ * Event: Pakistan Floods (Indus Basin)
+ * Location: Sukkur, Sindh, Pakistan
+ * Flood mapping: Sentinel-1 SAR
+ * RGB visualization: Sentinel-2 optical
+ ****/
+
+
+// ==========================
+// 1) AOI
+// ==========================
+
+var aoi = ee.Geometry.Rectangle([68.70, 27.55, 69.00, 27.85], null, false);
+
+Map.centerObject(aoi, 10);
+Map.addLayer(aoi, {color: 'red'}, 'AOI');
+
+
+// ==========================
+// 2) DATES
+// ==========================
+
+// Sentinel-1 flood detection dates
+var preStart  = '2022-07-15';
+var preEnd    = '2022-07-30';
+
+var postStart = '2022-08-20';
+var postEnd   = '2022-09-05';
+
+// Sentinel-2 RGB dates
+// Wider windows, but still close enough to show meaningful before/after conditions
+var rgbPreStart  = '2022-07-01';
+var rgbPreEnd    = '2022-08-05';
+
+var rgbPostStart = '2022-08-25';
+var rgbPostEnd   = '2022-09-20';
+
+
+// ==========================
+// 3) SENTINEL-1 SAR
+// ==========================
+
+var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(aoi)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
+  .filter(ee.Filter.eq('resolution_meters', 10))
+  .select('VV');
+
+var preCol = s1.filterDate(preStart, preEnd);
+var postCol = s1.filterDate(postStart, postEnd);
+
+print('Sentinel-1 pre scenes:', preCol.size());
+print('Sentinel-1 post scenes:', postCol.size());
+print('S1 pre scene IDs:', preCol.aggregate_array('system:index'));
+print('S1 post scene IDs:', postCol.aggregate_array('system:index'));
+
+var pre = preCol.median().clip(aoi);
+var post = postCol.median().clip(aoi);
+
+
+// ==========================
+// 4) SAR VISUALIZATION
+// ==========================
+
+var sarVis = {min: -25, max: 0};
+
+Map.addLayer(pre, sarVis, 'S1 Pre-flood VV', false);
+Map.addLayer(post, sarVis, 'S1 Post-flood VV', false);
+
+
+// ==========================
+// 5) SAR SMOOTHING
+// ==========================
+
+var preSmooth = pre.focal_mean({
+  radius: 50,
+  units: 'meters'
+});
+
+var postSmooth = post.focal_mean({
+  radius: 50,
+  units: 'meters'
+});
+
+Map.addLayer(preSmooth, sarVis, 'S1 Pre-flood VV Smoothed', false);
+Map.addLayer(postSmooth, sarVis, 'S1 Post-flood VV Smoothed', false);
+
+
+// ==========================
+// 6) CHANGE DETECTION
+// ==========================
+
+var diff = postSmooth.subtract(preSmooth).rename('VV_diff');
+
+Map.addLayer(
+  diff,
+  {min: -8, max: 4, palette: ['blue', 'white', 'red']},
+  'S1 Difference',
+  false
+);
+
+
+// ==========================
+// 7) INITIAL FLOOD MASK
+// ==========================
+
+// More negative = stronger drop in backscatter after flooding
+var floodThreshold = -2.0;
+
+var floodRaw = diff.lt(floodThreshold).rename('flood_raw');
+
+Map.addLayer(floodRaw.selfMask(), {palette: ['cyan']}, 'Flood Raw', false);
+
+
+// ==========================
+// 8) REMOVE STEEP TERRAIN
+// ==========================
+
+var dem = ee.Image('USGS/SRTMGL1_003');
+var slope = ee.Terrain.slope(dem).clip(aoi);
+var flatMask = slope.lt(5);
+
+Map.addLayer(slope, {min: 0, max: 10}, 'Slope', false);
+
+
+// ==========================
+// 9) REMOVE PERMANENT WATER
+// ==========================
+
+var gsw = ee.Image('JRC/GSW1_4/GlobalSurfaceWater');
+var permanentWater = gsw.select('occurrence').gte(80).clip(aoi);
+
+Map.addLayer(permanentWater.selfMask(), {palette: ['blue']}, 'Permanent Water', false);
+
+
+// ==========================
+// 10) CLEAN FINAL FLOOD MASK
+// ==========================
+
+var floodNoPermanent = floodRaw
+  .and(flatMask)
+  .and(permanentWater.not())
+  .rename('flood_noperm');
+
+var connected = floodNoPermanent.connectedPixelCount(100, true);
+var floodClean = floodNoPermanent.updateMask(connected.gte(10)).rename('flood_clean');
+
+Map.addLayer(floodNoPermanent.selfMask(), {palette: ['yellow']}, 'Flood No Permanent', false);
+Map.addLayer(floodClean.selfMask(), {palette: ['red']}, 'Flood Clean');
+
+
+// ==========================
+// 11) FLOOD AREA
+// ==========================
+
+var floodArea = floodClean.multiply(ee.Image.pixelArea()).rename('flood_area_m2');
+
+var floodStats = floodArea.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: aoi,
+  scale: 10,
+  maxPixels: 1e10
+});
+
+var areaM2 = ee.Number(floodStats.get('flood_area_m2'));
+var areaKm2 = areaM2.divide(1e6);
+
+print('Flooded area (m²):', areaM2);
+print('Flooded area (km²):', areaKm2);
+
+
+// ==========================
+// 12) LAND COVER IMPACT
+// ==========================
+
+var worldcover = ee.ImageCollection('ESA/WorldCover/v200').first().clip(aoi);
+var lc = worldcover.select('Map');
+
+var lcStats = ee.Image.pixelArea()
+  .addBands(lc)
+  .updateMask(floodClean)
+  .reduceRegion({
+    reducer: ee.Reducer.sum().group({
+      groupField: 1,
+      groupName: 'class'
+    }),
+    geometry: aoi,
+    scale: 10,
+    maxPixels: 1e10
+  });
+
+print('Flooded land cover stats:', lcStats);
+print('WorldCover classes:', {
+  10: 'Tree cover',
+  20: 'Shrubland',
+  30: 'Grassland',
+  40: 'Cropland',
+  50: 'Built-up',
+  60: 'Bare / sparse vegetation',
+  80: 'Permanent water bodies',
+  90: 'Herbaceous wetland',
+  95: 'Mangroves',
+  100: 'Moss and lichen'
+});
+
+
+// ==========================
+// 13) SENTINEL-2 RGB
+// ==========================
+
+// Sentinel-2 used ONLY for visualization
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(aoi);
+
+// Better cloud/shadow mask using SCL
+function maskS2sr(image) {
+  var scl = image.select('SCL');
+
+  var mask = scl.neq(0)   // no data
+    .and(scl.neq(1))      // saturated/defective
+    .and(scl.neq(3))      // cloud shadow
+    .and(scl.neq(8))      // medium cloud
+    .and(scl.neq(9))      // high cloud
+    .and(scl.neq(10))     // cirrus
+    .and(scl.neq(11));    // snow/ice
+
+  return image
+    .updateMask(mask)
+    .select(['B2', 'B3', 'B4'])
+    .copyProperties(image, image.propertyNames());
+}
+
+// Build safer RGB composite from best few scenes
+function getRgbComposite(startDate, endDate, label) {
+  var col = s2
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', 50))
+    .map(maskS2sr)
+    .sort('CLOUDY_PIXEL_PERCENTAGE');
+
+  print(label + ' S2 scene count:', col.size());
+  print(label + ' S2 scene IDs:', col.aggregate_array('system:index'));
+  print(label + ' S2 cloud %:', col.aggregate_array('CLOUDY_PIXEL_PERCENTAGE'));
+
+  // Use the 3 least cloudy scenes, then median them.
+  // This is much more stable than taking only col.first().
+  var best3 = col.limit(3);
+  var composite = best3.median().clip(aoi);
+
+  return composite;
+}
+
+var preRGB = getRgbComposite(rgbPreStart, rgbPreEnd, 'Pre RGB');
+var postRGB = getRgbComposite(rgbPostStart, rgbPostEnd, 'Post RGB');
+
+var rgbVis = {
+  bands: ['B4', 'B3', 'B2'],
+  min: 200,
+  max: 3500,
+  gamma: 1.2
+};
+
+Map.addLayer(preRGB, rgbVis, 'Pre-flood RGB');
+Map.addLayer(postRGB, rgbVis, 'Post-flood RGB');
+
+
+// ==========================
+// 14) FLOOD OVERLAY ON RGB
+// ==========================
+
+Map.addLayer(
+  postRGB,
+  rgbVis,
+  'Post-flood RGB Base',
+  false
+);
+
+Map.addLayer(
+  floodClean.selfMask(),
+  {palette: ['red']},
+  'Flood Overlay on RGB'
+);
+
+
+// ==========================
+// 15) EXPORTS
+// ==========================
+
+Export.image.toDrive({
+  image: floodClean.toByte(),
+  description: 'Pakistan_Flood_Extent_Final',
+  folder: 'GEE_Flood_Exercise',
+  fileNamePrefix: 'pakistan_flood_extent_final',
+  scale: 10,
+  region: aoi,
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: diff,
+  description: 'Pakistan_S1_Difference_Final',
+  folder: 'GEE_Flood_Exercise',
+  fileNamePrefix: 'pakistan_s1_difference_final',
+  scale: 10,
+  region: aoi,
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: preRGB.select(['B4', 'B3', 'B2']),
+  description: 'Pakistan_PreFlood_RGB_Final',
+  folder: 'GEE_Flood_Exercise',
+  fileNamePrefix: 'pakistan_preflood_rgb_final',
+  region: aoi,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: postRGB.select(['B4', 'B3', 'B2']),
+  description: 'Pakistan_PostFlood_RGB_Final',
+  folder: 'GEE_Flood_Exercise',
+  fileNamePrefix: 'pakistan_postflood_rgb_final',
+  region: aoi,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: postRGB.visualize({
+    bands: ['B4', 'B3', 'B2'],
+    min: 200,
+    max: 3500,
+    gamma: 1.2
+  }).blend(
+    floodClean.selfMask().visualize({palette: ['red']})
+  ),
+  description: 'Pakistan_PostRGB_FloodOverlay_Final',
+  folder: 'GEE_Flood_Exercise',
+  fileNamePrefix: 'pakistan_postrgb_floodoverlay_final',
+  region: aoi,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+Export.table.toDrive({
+  collection: ee.FeatureCollection([ee.Feature(aoi, {name: 'Sukkur_AOI'})]),
+  description: 'Pakistan_Flood_AOI_Final',
+  folder: 'GEE_Flood_Exercise',
+  fileNamePrefix: 'pakistan_flood_aoi_final',
+  fileFormat: 'SHP'
+});
+
+/**** FINAL URBAN FLOOD DETECTION SCRIPT
+ * Event: Pakistan Floods (Indus Basin)
+ * Location: Sukkur, Sindh, Pakistan
+ * Flood mapping: Sentinel-1 SAR
+ * RGB visualization: Sentinel-2 optical
+ * Final result: URBAN FLOOD ONLY
+ ****/
+
+
+// ==========================
+// 1) AOI
+// ==========================
+
+var aoi = ee.Geometry.Rectangle([68.70, 27.55, 69.00, 27.85], null, false);
+
+Map.centerObject(aoi, 10);
+Map.addLayer(aoi, {color: 'red'}, 'AOI');
+
+
+// ==========================
+// 2) DATES
+// ==========================
+
+// Sentinel-1 flood detection dates
+var preStart  = '2022-07-15';
+var preEnd    = '2022-07-30';
+
+var postStart = '2022-08-20';
+var postEnd   = '2022-09-05';
+
+// Sentinel-2 RGB dates for visualization
+var rgbPreStart  = '2022-07-01';
+var rgbPreEnd    = '2022-08-05';
+
+var rgbPostStart = '2022-08-25';
+var rgbPostEnd   = '2022-09-20';
+
+
+// ==========================
+// 3) SENTINEL-1 SAR
+// ==========================
+
+var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(aoi)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
+  .filter(ee.Filter.eq('resolution_meters', 10))
+  .select('VV');
+
+var preCol = s1.filterDate(preStart, preEnd);
+var postCol = s1.filterDate(postStart, postEnd);
+
+print('Sentinel-1 pre scenes:', preCol.size());
+print('Sentinel-1 post scenes:', postCol.size());
+print('S1 pre scene IDs:', preCol.aggregate_array('system:index'));
+print('S1 post scene IDs:', postCol.aggregate_array('system:index'));
+
+var pre = preCol.median().clip(aoi);
+var post = postCol.median().clip(aoi);
+
+
+// ==========================
+// 4) SAR VISUALIZATION
+// ==========================
+
+var sarVis = {min: -25, max: 0};
+
+Map.addLayer(pre, sarVis, 'S1 Pre-flood VV', false);
+Map.addLayer(post, sarVis, 'S1 Post-flood VV', false);
+
+
+// ==========================
+// 5) SAR SMOOTHING
+// ==========================
+
+var preSmooth = pre.focal_mean({
+  radius: 50,
+  units: 'meters'
+});
+
+var postSmooth = post.focal_mean({
+  radius: 50,
+  units: 'meters'
+});
+
+Map.addLayer(preSmooth, sarVis, 'S1 Pre-flood VV Smoothed', false);
+Map.addLayer(postSmooth, sarVis, 'S1 Post-flood VV Smoothed', false);
+
+
+// ==========================
+// 6) CHANGE DETECTION
+// ==========================
+
+var diff = postSmooth.subtract(preSmooth).rename('VV_diff');
+
+Map.addLayer(
+  diff,
+  {min: -8, max: 4, palette: ['blue', 'white', 'red']},
+  'S1 Difference',
+  false
+);
+
+
+// ==========================
+// 7) INITIAL FLOOD MASK
+// ==========================
+
+var floodThreshold = -2.0;
+var floodRaw = diff.lt(floodThreshold).rename('flood_raw');
+
+Map.addLayer(floodRaw.selfMask(), {palette: ['cyan']}, 'Flood Raw', false);
+
+
+// ==========================
+// 8) REMOVE STEEP TERRAIN
+// ==========================
+
+var dem = ee.Image('USGS/SRTMGL1_003');
+var slope = ee.Terrain.slope(dem).clip(aoi);
+var flatMask = slope.lt(5);
+
+Map.addLayer(slope, {min: 0, max: 10}, 'Slope', false);
+
+
+// ==========================
+// 9) REMOVE PERMANENT WATER
+// ==========================
+
+var gsw = ee.Image('JRC/GSW1_4/GlobalSurfaceWater');
+var permanentWater = gsw.select('occurrence').gte(80).clip(aoi);
+
+Map.addLayer(permanentWater.selfMask(), {palette: ['blue']}, 'Permanent Water', false);
+
+
+// ==========================
+// 10) FLOOD MASK BEFORE URBAN FILTER
+// ==========================
+
+var floodNoPermanent = floodRaw
+  .and(flatMask)
+  .and(permanentWater.not())
+  .rename('flood_noperm');
+
+var connected = floodNoPermanent.connectedPixelCount(100, true);
+var floodClean = floodNoPermanent.updateMask(connected.gte(10)).rename('flood_clean');
+
+Map.addLayer(floodClean.selfMask(), {palette: ['yellow']}, 'Flood Clean (All Land)', false);
+
+
+// ==========================
+// 11) BUILT-UP MASK FOR URBAN FLOOD ONLY
+// ==========================
+
+// ESA WorldCover class 50 = Built-up
+var worldcover = ee.ImageCollection('ESA/WorldCover/v200').first().clip(aoi);
+var lc = worldcover.select('Map');
+
+var builtUp = lc.eq(50).rename('built_up');
+
+// Optional slight expansion to include roads / edges near built-up fabric
+// Comment this out if you want strict built-up only
+var builtUpBuffered = builtUp
+  .focal_max({
+    radius: 20,
+    units: 'meters'
+  })
+  .rename('built_up_buffered');
+
+Map.addLayer(builtUp.selfMask(), {palette: ['magenta']}, 'Built-up Only', false);
+Map.addLayer(builtUpBuffered.selfMask(), {palette: ['purple']}, 'Built-up Buffered', false);
+
+
+// ==========================
+// 12) URBAN FLOOD ONLY
+// ==========================
+
+// Strict urban flood
+var urbanFlood = floodClean.and(builtUp).rename('urban_flood');
+
+// Slightly relaxed urban flood near built-up edges
+var urbanFloodBuffered = floodClean.and(builtUpBuffered).rename('urban_flood_buffered');
+
+Map.addLayer(urbanFlood.selfMask(), {palette: ['red']}, 'Urban Flood Only');
+Map.addLayer(urbanFloodBuffered.selfMask(), {palette: ['orange']}, 'Urban Flood Buffered', false);
+
+
+// ==========================
+// 13) URBAN FLOOD AREA
+// ==========================
+
+var urbanFloodArea = urbanFlood.multiply(ee.Image.pixelArea()).rename('urban_flood_area_m2');
+
+var urbanStats = urbanFloodArea.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: aoi,
+  scale: 10,
+  maxPixels: 1e10
+});
+
+var urbanAreaM2 = ee.Number(urbanStats.get('urban_flood_area_m2'));
+var urbanAreaKm2 = urbanAreaM2.divide(1e6);
+
+print('Urban flooded area (m²):', urbanAreaM2);
+print('Urban flooded area (km²):', urbanAreaKm2);
+
+
+// ==========================
+// 14) LAND COVER IMPACT
+// ==========================
+
+var lcStats = ee.Image.pixelArea()
+  .addBands(lc)
+  .updateMask(floodClean)
+  .reduceRegion({
+    reducer: ee.Reducer.sum().group({
+      groupField: 1,
+      groupName: 'class'
+    }),
+    geometry: aoi,
+    scale: 10,
+    maxPixels: 1e10
+  });
+
+print('Flooded land cover stats (all flooded land):', lcStats);
+print('WorldCover classes:', {
+  10: 'Tree cover',
+  20: 'Shrubland',
+  30: 'Grassland',
+  40: 'Cropland',
+  50: 'Built-up',
+  60: 'Bare / sparse vegetation',
+  80: 'Permanent water bodies',
+  90: 'Herbaceous wetland',
+  95: 'Mangroves',
+  100: 'Moss and lichen'
+});
+
+
+// ==========================
+// 15) SENTINEL-2 RGB
+// ==========================
+
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(aoi);
+
+function maskS2sr(image) {
+  var scl = image.select('SCL');
+
+  var mask = scl.neq(0)
+    .and(scl.neq(1))
+    .and(scl.neq(3))
+    .and(scl.neq(8))
+    .and(scl.neq(9))
+    .and(scl.neq(10))
+    .and(scl.neq(11));
+
+  return image
+    .updateMask(mask)
+    .select(['B2', 'B3', 'B4'])
+    .copyProperties(image, image.propertyNames());
+}
+
+function getRgbComposite(startDate, endDate, label) {
+  var col = s2
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', 50))
+    .map(maskS2sr)
+    .sort('CLOUDY_PIXEL_PERCENTAGE');
+
+  print(label + ' S2 scene count:', col.size());
+  print(label + ' S2 scene IDs:', col.aggregate_array('system:index'));
+  print(label + ' S2 cloud %:', col.aggregate_array('CLOUDY_PIXEL_PERCENTAGE'));
+
+  var best3 = col.limit(3);
+  var composite = best3.median().clip(aoi);
+
+  return composite;
+}
+
+var preRGB = getRgbComposite(rgbPreStart, rgbPreEnd, 'Pre RGB');
+var postRGB = getRgbComposite(rgbPostStart, rgbPostEnd, 'Post RGB');
+
+var rgbVis = {
+  bands: ['B4', 'B3', 'B2'],
+  min: 200,
+  max: 3500,
+  gamma: 1.2
+};
+
+Map.addLayer(preRGB, rgbVis, 'Pre-flood RGB');
+Map.addLayer(postRGB, rgbVis, 'Post-flood RGB');
+
+
+// ==========================
+// 16) URBAN FLOOD OVERLAY ON RGB
+// ==========================
+
+Map.addLayer(
+  urbanFlood.selfMask(),
+  {palette: ['red']},
+  'Urban Flood on RGB'
+);
+
+
+// ==========================
+// 17) EXPORTS
+// ==========================
+
+Export.image.toDrive({
+  image: urbanFlood.toByte(),
+  description: 'Pakistan_Urban_Flood_Extent_Final',
+  folder: 'GEE_Flood_Exercise',
+  fileNamePrefix: 'pakistan_urban_flood_extent_final',
+  scale: 10,
+  region: aoi,
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: floodClean.toByte(),
+  description: 'Pakistan_AllFlood_Extent_Final',
+  folder: 'GEE_Flood_Exercise',
+  fileNamePrefix: 'pakistan_allflood_extent_final',
+  scale: 10,
+  region: aoi,
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: diff,
+  description: 'Pakistan_S1_Difference_Final',
+  folder: 'GEE_Flood_Exercise',
+  fileNamePrefix: 'pakistan_s1_difference_final',
+  scale: 10,
+  region: aoi,
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: preRGB.select(['B4', 'B3', 'B2']),
+  description: 'Pakistan_PreFlood_RGB_Final',
+  folder: 'GEE_Flood_Exercise',
+  fileNamePrefix: 'pakistan_preflood_rgb_final',
+  region: aoi,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: postRGB.select(['B4', 'B3', 'B2']),
+  description: 'Pakistan_PostFlood_RGB_Final',
+  folder: 'GEE_Flood_Exercise',
+  fileNamePrefix: 'pakistan_postflood_rgb_final',
+  region: aoi,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: postRGB.visualize({
+    bands: ['B4', 'B3', 'B2'],
+    min: 200,
+    max: 3500,
+    gamma: 1.2
+  }).blend(
+    urbanFlood.selfMask().visualize({palette: ['red']})
+  ),
+  description: 'Pakistan_PostRGB_UrbanFloodOverlay_Final',
+  folder: 'GEE_Flood_Exercise',
+  fileNamePrefix: 'pakistan_postrgb_urbanfloodoverlay_final',
+  region: aoi,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+Export.table.toDrive({
+  collection: ee.FeatureCollection([ee.Feature(aoi, {name: 'Sukkur_AOI'})]),
+  description: 'Pakistan_Urban_Flood_AOI_Final',
+  folder: 'GEE_2Flood_Exercise',
+  fileNamePrefix: 'pakistan_urban_flood_aoi_final',
+  fileFormat: 'SHP'
+});
+
+
+// ==========================
+// WATER DETECTION AND FLOOD EXTENT
+// ==========================
+
+var preSmooth = pre.focal_mean({
+  radius: 50,
+  units: 'meters'
+});
+
+var postSmooth = post.focal_mean({
+  radius: 50,
+  units: 'meters'
+});
+
+Map.addLayer(preSmooth, sarVis, 'S1 Pre-flood VV Smoothed', false);
+Map.addLayer(postSmooth, sarVis, 'S1 Post-flood VV Smoothed', false);
+
+// Water threshold in VV backscatter
+var waterThreshold = -16;
+
+// Water masks
+var preWater = preSmooth.lt(waterThreshold).rename('pre_water');
+var postWater = postSmooth.lt(waterThreshold).rename('post_water');
+
+Map.addLayer(preWater.selfMask(), {palette: ['blue']}, 'Pre-flood Water', false);
+Map.addLayer(postWater.selfMask(), {palette: ['cyan']}, 'Post-flood Water', false);
+
+// Flood = water after flood but not before flood
+var floodRaw = postWater.and(preWater.not()).rename('flood_raw');
+
+Map.addLayer(floodRaw.selfMask(), {palette: ['red']}, 'Flood Raw');
+
+// Difference layer for interpretation
+var diff = postSmooth.subtract(preSmooth).rename('VV_diff');
+
+Map.addLayer(
+  diff,
+  {min: -8, max: 4, palette: ['blue', 'white', 'red']},
+  'S1 Difference',
+  false
+);
+
+// Debug counts
+var rawCount = floodRaw.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: aoi,
+  scale: 10,
+  maxPixels: 1e10
+});
+
+var cleanCount = floodClean.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: aoi,
+  scale: 10,
+  maxPixels: 1e10
+});
+
+var builtCount = builtUp.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: aoi,
+  scale: 10,
+  maxPixels: 1e10
+});
+
+var urbanCount = urbanFlood.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: aoi,
+  scale: 10,
+  maxPixels: 1e10
+});
+
+print('Flood raw pixel count:', rawCount);
+print('Flood clean pixel count:', cleanCount);
+print('Built-up pixel count:', builtCount);
+print('Urban flood pixel count:', urbanCount);
